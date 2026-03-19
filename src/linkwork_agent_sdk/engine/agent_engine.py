@@ -51,6 +51,7 @@ class AgentEngine:
         redis_client: RedisClient | None = None,
         session_id: str | None = None,
         runtime_system_prompt_append: str | None = None,
+        runtime_model_override: str | None = None,
     ) -> None:
         self._config_file = Path(config_file)
         self._task_id = task_id or os.getenv(ENV_TASK_ID) or f"task-{uuid.uuid4().hex[:8]}"
@@ -73,6 +74,9 @@ class AgentEngine:
         self._runtime_symbols: dict[str, Any] = {}
         self._runtime_system_prompt_append = (
             runtime_system_prompt_append.strip() if runtime_system_prompt_append else ""
+        )
+        self._runtime_model_override = (
+            runtime_model_override.strip() if runtime_model_override else ""
         )
 
         self._running_lock = asyncio.Lock()
@@ -355,7 +359,7 @@ class AgentEngine:
             "permission_mode": self._config.agent.permission_mode,
             "max_turns": self._config.agent.max_turns,
             "max_thinking_tokens": self._config.agent.max_thinking_tokens,
-            "model": self._config.claude_settings.model,
+            "model": _resolve_runtime_model(self._runtime_model_override),
             "cwd": str(self.cwd),
             "mcp_servers": self._mcp.get_mcp_servers_config(),
             "hooks": hooks,
@@ -1012,22 +1016,40 @@ def _resolve_env_placeholders(
     workstation_id: str,
     task_id: str,
 ) -> dict[str, str]:
-    """Replace {workstationid}, {taskid}, {userid} placeholders in env values.
+    """Replace runtime placeholders in env values.
 
-    Per config-system.md §6.3, these placeholders are resolved before
+    Per config-system.md §6.3, placeholders are resolved before
     passing env to the runtime.
     """
     if not env:
         return {}
     user_id = os.getenv("USER_ID", "")
+    litellm_base_url = os.getenv("LITELLM_BASE_URL", "").strip().rstrip("/")
+    litellm_api_key = os.getenv("LITELLM_API_KEY", "").strip()
+    litellm_chat_model = os.getenv("LITELLM_CHAT_MODEL", "").strip()
+    litellm_embed_model = os.getenv("LITELLM_EMBED_MODEL", "").strip()
     resolved: dict[str, str] = {}
     for key, value in env.items():
         resolved[key] = (
             value.replace("{workstationid}", workstation_id)
             .replace("{taskid}", task_id)
             .replace("{userid}", user_id)
+            .replace("{litellm_base_url}", litellm_base_url)
+            .replace("{litellm_api_key}", litellm_api_key)
+            .replace("{litellm_chat_model}", litellm_chat_model)
+            .replace("{litellm_embed_model}", litellm_embed_model)
         )
     return resolved
+
+
+def _resolve_runtime_model(runtime_override: str = "") -> str:
+    """Resolve runtime model from explicit task override only."""
+    runtime_model = runtime_override.strip()
+    if runtime_model:
+        return runtime_model
+    raise RuntimeInitError(
+        "LiteLLM chat model is required: set task selected_model/runtime_model_override"
+    )
 
 
 def _preset_prompt(preset: str) -> str:
