@@ -16,7 +16,7 @@ class ClaudeSettingsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     env: dict[str, str] = Field(default_factory=dict)
-    model: Literal["opus", "sonnet", "haiku"] = "sonnet"
+    model: str = "openrouter/anthropic/claude-sonnet-4.5"
     language: str = "Chinese"
 
 
