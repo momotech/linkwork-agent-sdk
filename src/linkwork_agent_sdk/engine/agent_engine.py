@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import inspect
 import json
 import logging
@@ -14,14 +15,23 @@ import traceback
 import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from ..config import ConfigLoader, LinkWorkAgentSDKConfig
 from ..constants import (
+    ENV_LINKWORK_WATERMARK_NAME,
+    ENV_LINKWORK_WATERMARK_OWNER,
+    ENV_LINKWORK_WATERMARK_POLICY_URL,
+    ENV_LINKWORK_WATERMARK_REPO_URL,
     ENV_TASK_ID,
     ENV_WORKSTATION_ID,
     LOG_FALLBACK_DIR,
     SECURITY_CHECK_TIMEOUT_SECONDS,
+    WATERMARK_DEFAULT_OWNER,
+    WATERMARK_DEFAULT_POLICY_URL,
+    WATERMARK_DEFAULT_PRODUCT,
+    WATERMARK_DEFAULT_REPO_URL,
 )
 from ..exceptions import ConcurrentExecutionError, RuntimeInitError, RuntimeProtocolError
 from ..logger import (
@@ -72,6 +82,7 @@ class AgentEngine:
         self._runtime_client: Any = None
         self._runtime_entered = False
         self._runtime_symbols: dict[str, Any] = {}
+        self._runtime_provider = "claude"
         self._runtime_system_prompt_append = (
             runtime_system_prompt_append.strip() if runtime_system_prompt_append else ""
         )
@@ -113,6 +124,7 @@ class AgentEngine:
         try:
             # 1) Config
             self._config = self._config_loader.load()
+            self._runtime_provider = self._config.runtime.provider
 
             # 2) Logger
             if self._redis_client is None:
@@ -139,6 +151,10 @@ class AgentEngine:
             await self._logger.record(
                 LogEventType.CONFIG_LOADED,
                 {"config_path": str(self._config_file)},
+            )
+            await self._logger.record(
+                LogEventType.WATERMARK_ATTACHED,
+                self._build_identity_watermark_metadata(),
             )
 
             # 3) Security
@@ -231,6 +247,7 @@ class AgentEngine:
         self._zz_enabled = False
         self._entered = False
         self._runtime_skills_dir = None
+        self._runtime_provider = "claude"
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         cleanup_error: Exception | None = None
@@ -284,12 +301,13 @@ class AgentEngine:
         self._zz_enabled = False
         self._entered = False
         self._runtime_skills_dir = None
+        self._runtime_provider = "claude"
 
         if exc is None and cleanup_error is not None:
             raise cleanup_error
 
     async def run(self, task: str) -> AsyncGenerator[Any, None]:
-        """Run one task and yield streaming messages from Claude SDK client."""
+        """Run one task and yield streaming messages from runtime client."""
         if self._runtime_client is None:
             raise RuntimeInitError("Runtime is not initialized")
         if self._running_lock.locked():
@@ -298,7 +316,7 @@ class AgentEngine:
         async with self._running_lock:
             self._reset_required_skill_state()
             try:
-                guarded_task = self._build_task_with_skill_guard(task)
+                guarded_task = self._prepare_runtime_task(task)
                 await self._record_skill_selected_event()
                 await self._runtime_client.query(guarded_task)
                 async for message in self._runtime_client.receive_response():
@@ -309,6 +327,13 @@ class AgentEngine:
                 self._reset_required_skill_state()
 
     def _load_runtime_symbols(self) -> dict[str, Any]:
+        if self._runtime_provider == "pi":
+            return {}
+        if self._runtime_provider != "claude":
+            raise RuntimeInitError(f"Unsupported runtime provider: {self._runtime_provider}")
+        return self._load_claude_runtime_symbols()
+
+    def _load_claude_runtime_symbols(self) -> dict[str, Any]:
         try:
             import claude_agent_sdk as sdk  # type: ignore
         except ImportError as error:
@@ -326,6 +351,13 @@ class AgentEngine:
         return symbols
 
     def _build_runtime_client(self) -> Any:
+        if self._runtime_provider == "pi":
+            return self._build_pi_runtime_client()
+        if self._runtime_provider != "claude":
+            raise RuntimeInitError(f"Unsupported runtime provider: {self._runtime_provider}")
+        return self._build_claude_runtime_client()
+
+    def _build_claude_runtime_client(self) -> Any:
         sdk = self._runtime_symbols["sdk"]
         options = self._build_runtime_options()
 
@@ -384,6 +416,47 @@ class AgentEngine:
             return options_class(**options_dict)
         return options_dict
 
+    def _build_pi_runtime_client(self) -> Any:
+        options = self._build_pi_runtime_options()
+        return _PiRPCRuntimeClient(
+            cwd=self.cwd,
+            model=options["model"],
+            env=options["env"],
+        )
+
+    def _build_pi_runtime_options(self) -> dict[str, Any]:
+        if self._config is None:
+            raise RuntimeInitError("Config must be loaded before options build")
+
+        env_source = self._config.pi_settings.env or self._config.claude_settings.env
+        resolved_env = _resolve_env_placeholders(
+            env_source,
+            workstation_id=self._workstation_id,
+            task_id=self._task_id,
+        )
+        runtime_model = (
+            self._runtime_model_override
+            or self._config.pi_settings.model
+            or self._config.claude_settings.model
+        )
+        return {
+            "model": runtime_model.strip(),
+            "env": resolved_env,
+        }
+
+    def _prepare_runtime_task(self, task: str) -> str:
+        guarded_task = self._build_task_with_skill_guard(task)
+        if self._runtime_provider != "pi":
+            return guarded_task
+
+        if self._config is None:
+            return guarded_task
+
+        system_prompt = self._build_pi_system_prompt(self._config).strip()
+        if not system_prompt:
+            return guarded_task
+        return f"{system_prompt}\n\nUser task:\n{guarded_task}"
+
     def _build_system_prompt(
         self, config: LinkWorkAgentSDKConfig,
     ) -> dict[str, Any] | str:
@@ -407,6 +480,7 @@ class AgentEngine:
             append_parts.append(
                 f"Please respond in {language} unless the user explicitly asks for another language.",
             )
+        append_parts.append(self._build_identity_watermark_prompt())
 
         user_append = config.system_prompt.append.strip()
         if user_append:
@@ -433,6 +507,53 @@ class AgentEngine:
         if append_text:
             parts.append(append_text)
         return "\n\n".join(parts) if parts else ""
+
+    def _build_pi_system_prompt(self, config: LinkWorkAgentSDKConfig) -> str:
+        append_parts: list[str] = []
+
+        language = config.pi_settings.language.strip() or config.claude_settings.language.strip()
+        if language:
+            append_parts.append(
+                f"Please respond in {language} unless the user explicitly asks for another language.",
+            )
+        append_parts.append(self._build_identity_watermark_prompt())
+
+        user_append = config.system_prompt.append.strip()
+        if user_append:
+            append_parts.append(user_append)
+
+        runtime_append = self._runtime_system_prompt_append.strip()
+        if runtime_append:
+            append_parts.append(runtime_append)
+
+        return "\n\n".join(p for p in append_parts if p)
+
+    def _build_identity_watermark_metadata(self) -> dict[str, str]:
+        product = os.getenv(ENV_LINKWORK_WATERMARK_NAME, WATERMARK_DEFAULT_PRODUCT).strip()
+        owner = os.getenv(ENV_LINKWORK_WATERMARK_OWNER, WATERMARK_DEFAULT_OWNER).strip()
+        repo_url = os.getenv(ENV_LINKWORK_WATERMARK_REPO_URL, WATERMARK_DEFAULT_REPO_URL).strip()
+        policy_url = os.getenv(
+            ENV_LINKWORK_WATERMARK_POLICY_URL,
+            WATERMARK_DEFAULT_POLICY_URL,
+        ).strip()
+        return {
+            "product": product or WATERMARK_DEFAULT_PRODUCT,
+            "owner": owner or WATERMARK_DEFAULT_OWNER,
+            "repo_url": repo_url or WATERMARK_DEFAULT_REPO_URL,
+            "policy_url": policy_url or WATERMARK_DEFAULT_POLICY_URL,
+        }
+
+    def _build_identity_watermark_prompt(self) -> str:
+        metadata = self._build_identity_watermark_metadata()
+        return (
+            "[Platform Identity Watermark]\n"
+            f"You are running inside {metadata['product']}.\n"
+            f"Project owner: {metadata['owner']}.\n"
+            f"Official repository: {metadata['repo_url']}.\n"
+            f"Trademark policy: {metadata['policy_url']}.\n"
+            "Never claim this runtime belongs to another platform or vendor.\n"
+            "If asked about runtime/source identity, answer with this watermark information."
+        )
 
     def _build_allowed_tools(self, configured_tools: list[str]) -> list[str]:
         if not configured_tools:
@@ -959,6 +1080,180 @@ class _QueryRuntimeClient:
             return
         async for message in self._iterator:
             yield message
+
+
+class _PiRPCRuntimeClient:
+    """RPC client adapter for pi CLI."""
+
+    def __init__(
+        self,
+        cwd: Path,
+        model: str,
+        env: dict[str, str],
+    ) -> None:
+        self._cwd = cwd
+        self._model = model
+        self._env = env
+        self._process: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._stderr_buffer: list[str] = []
+        self._request_id: str | None = None
+
+    async def __aenter__(self) -> "_PiRPCRuntimeClient":
+        pi_path = shutil.which("pi")
+        if not pi_path:
+            raise RuntimeInitError("runtime.provider=pi requires 'pi' CLI in PATH")
+
+        cmd = [pi_path, "--mode", "rpc", "--no-session"]
+        if self._model:
+            cmd.extend(["--model", self._model])
+
+        env = os.environ.copy()
+        env.update(self._env)
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(self._cwd),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        process = self._process
+        self._process = None
+
+        if process is not None and process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stderr_task
+            self._stderr_task = None
+
+    async def query(self, task: str) -> None:
+        process = self._process
+        if process is None or process.stdin is None:
+            raise RuntimeInitError("pi runtime is not initialized")
+
+        self._request_id = f"req-{uuid.uuid4().hex[:8]}"
+        payload = {
+            "id": self._request_id,
+            "type": "prompt",
+            "message": task,
+        }
+        process.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        await process.stdin.drain()
+
+    async def receive_response(self):
+        process = self._process
+        if process is None or process.stdout is None:
+            raise RuntimeInitError("pi runtime is not initialized")
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                _logger.warning("pi rpc emitted non-json line: %s", raw[:500])
+                continue
+
+            event_type = str(event.get("type", "")).strip()
+            if event_type == "response":
+                if (
+                    self._request_id
+                    and event.get("id") == self._request_id
+                    and event.get("command") == "prompt"
+                    and not bool(event.get("success"))
+                ):
+                    error = str(event.get("error", "")).strip() or "unknown error"
+                    raise RuntimeProtocolError(f"pi rpc prompt failed: {error}")
+                continue
+
+            if event_type == "agent_end":
+                return
+
+            if event_type in {"message_update", "message_end"}:
+                message = _pi_event_to_runtime_message(event)
+                if message is not None:
+                    yield message
+                continue
+
+            if event_type == "error":
+                error = str(event.get("error", "")).strip() or raw
+                raise RuntimeProtocolError(f"pi rpc error: {error}")
+
+        return_code = await process.wait()
+        if return_code != 0:
+            raise RuntimeProtocolError(
+                f"pi rpc exited with code {return_code}: {self._stderr_tail()}",
+            )
+
+    async def _drain_stderr(self) -> None:
+        process = self._process
+        if process is None or process.stderr is None:
+            return
+
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            self._stderr_buffer.append(text)
+            if len(self._stderr_buffer) > 200:
+                self._stderr_buffer = self._stderr_buffer[-200:]
+
+    def _stderr_tail(self) -> str:
+        if not self._stderr_buffer:
+            return "no stderr output"
+        return " | ".join(self._stderr_buffer[-5:])
+
+
+def _pi_event_to_runtime_message(event: dict[str, Any]) -> Any | None:
+    message = event.get("message")
+    if isinstance(message, dict):
+        return _to_runtime_message(message)
+
+    assistant_event = event.get("assistantMessageEvent")
+    if isinstance(assistant_event, dict):
+        delta = assistant_event.get("delta")
+        if isinstance(delta, str) and delta:
+            return _to_runtime_message({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": delta,
+                    },
+                ],
+            })
+    return None
+
+
+def _to_runtime_message(message: dict[str, Any]) -> Any:
+    raw_content = message.get("content")
+    blocks: list[Any] = []
+    if isinstance(raw_content, list):
+        for item in raw_content:
+            if isinstance(item, dict):
+                blocks.append(SimpleNamespace(**item))
+    return SimpleNamespace(content=blocks)
 
 
 def _extract_runtime_api_error(text: str) -> str | None:
