@@ -78,7 +78,7 @@ asyncio.run(main())
 
 ### Option A: Bundle into LinkWork role image (primary path)
 
-In `LinkWork/back`, `build.sh` injects SDK sources into image build context and installs them into role images (`/opt/linkwork-agent-build/sdk-source`).
+In `LinkWork/backend`, `build.sh` injects SDK sources into image build context and installs them into role images (`/opt/linkwork-agent-build/sdk-source`).
 
 Use this path for production task runtime.
 

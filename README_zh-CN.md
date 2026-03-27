@@ -76,7 +76,7 @@ asyncio.run(main())
 
 ### 方案 A：随 LinkWork 角色镜像发布（主路径）
 
-在 `LinkWork/back` 的构建流程中，`build.sh` 会将 SDK 源码打入构建上下文并安装到角色镜像（`/opt/linkwork-agent-build/sdk-source`）。
+在 `LinkWork/backend` 的构建流程中，`build.sh` 会将 SDK 源码打入构建上下文并安装到角色镜像（`/opt/linkwork-agent-build/sdk-source`）。
 
 适用场景：生产任务运行时。
 
